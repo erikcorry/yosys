@@ -192,6 +192,17 @@ std::string format_src_location(DesignObj *obj)
 #endif
 }
 
+std::string format_src_attribute(DesignObj *obj)
+{
+	if (obj == nullptr || !obj->Linefile())
+		return std::string();
+#ifdef VERIFIC_LINEFILE_INCLUDES_COLUMNS
+	return RTLIL::format_src_range(LineFile::GetFileName(obj->Linefile()), obj->Linefile()->GetLeftLine(), obj->Linefile()->GetLeftCol(), obj->Linefile()->GetRightLine(), obj->Linefile()->GetRightCol());
+#else
+	return stringf("%s:%06d", LineFile::GetFileName(obj->Linefile()), LineFile::GetLineNo(obj->Linefile()));
+#endif
+}
+
 std::string announce_src_location(DesignObj *obj)
 {
 	std::string loc = format_src_location(obj);
@@ -266,7 +277,7 @@ RTLIL::IdString VerificImporter::new_verific_id(Verific::DesignObj *obj)
 {
 	std::string s = stringf("$verific$%s", obj->Name());
 	if (obj->Linefile())
-		s += stringf("$%s:%d", RTLIL::encode_filename(Verific::LineFile::GetFileName(obj->Linefile())), Verific::LineFile::GetLineNo(obj->Linefile()));
+		s += stringf("$%s", RTLIL::encode_src_line(Verific::LineFile::GetFileName(obj->Linefile()), Verific::LineFile::GetLineNo(obj->Linefile())));
 	s += stringf("$%d", autoidx++);
 	return module->twines().add(std::move(s));
 }
@@ -451,7 +462,7 @@ void VerificImporter::import_attributes(dict<RTLIL::IdString, RTLIL::Const> &att
 	Att *attr;
 
 	if (obj->Linefile())
-		attributes[ID::src] = format_src_location(obj);
+		attributes[ID::src] = format_src_attribute(obj);
 
 	FOREACH_ATTRIBUTE(obj, mi, attr) {
 		if (attr->Key()[0] == ' ' || attr->Value() == nullptr)

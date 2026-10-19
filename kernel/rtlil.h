@@ -185,6 +185,20 @@ namespace RTLIL {
 		return val.str();
 	}
 
+	// "file:line" for use in generated object names. The line number is
+	// zero-padded so that names sort the same way as their line numbers
+	// and shifting code by a few lines doesn't change the name length.
+	static inline std::string encode_src_line(const std::string &filename, int line)
+	{
+		return stringf("%s:%06d", encode_filename(filename), line);
+	}
+
+	// "file:line.col-line.col" for src attributes, padded like encode_src_line().
+	static inline std::string format_src_range(const std::string &filename, int begin_line, int begin_column, int end_line, int end_column)
+	{
+		return stringf("%s:%06d.%04d-%06d.%04d", filename, begin_line, begin_column, end_line, end_column);
+	}
+
 	// see calc.cc for the implementation of this functions
 	RTLIL::Const const_not         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len);
 	RTLIL::Const const_and         (const RTLIL::Const &arg1, const RTLIL::Const &arg2, bool signed1, bool signed2, int result_len);

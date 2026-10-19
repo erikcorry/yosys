@@ -944,7 +944,7 @@ std::unique_ptr<AstNode> AstNode::mktemp_logic(AstSrcLocType loc, const std::str
 {
 	auto wire_owned = std::make_unique<AstNode>(loc, AST_WIRE, std::make_unique<AstNode>(loc, AST_RANGE, mkconst_int(loc, range_left, true), mkconst_int(loc, range_right, true)));
 	auto* wire = wire_owned.get();
-	wire->str = stringf("%s%s:%d$%d", name, RTLIL::encode_filename(*location.begin.filename), location.begin.line, autoidx++);
+	wire->str = stringf("%s%s$%d", name, RTLIL::encode_src_line(*location.begin.filename, location.begin.line), autoidx++);
 	if (nosync)
 		wire->set_attribute(ID::nosync, AstNode::mkconst_int(loc, 1, false));
 	wire->is_signed = is_signed;
@@ -1137,8 +1137,8 @@ IdString AST::intern_hier_name(RTLIL::Design *design, std::string_view escaped)
 
 IdString AST::intern_src_loc(RTLIL::Design *design, const AstSrcLocType &location)
 {
-	return design->twines().add(stringf("$%s:%d",
-			RTLIL::encode_filename(*location.begin.filename), location.begin.line));
+	return design->twines().add(stringf("$%s",
+			RTLIL::encode_src_line(*location.begin.filename, location.begin.line)));
 }
 
 IdString AST::intern_src_name(RTLIL::Design *design, const AstSrcLocType &location,
@@ -1150,7 +1150,8 @@ IdString AST::intern_src_name(RTLIL::Design *design, const AstSrcLocType &locati
 
 void AST::set_src_attr(RTLIL::AttrObject *obj, const AstNode *ast)
 {
-	obj->attributes[ID::src] = ast->loc_string();
+	const AstSrcLocType &loc = ast->location;
+	obj->attributes[ID::src] = RTLIL::format_src_range(*loc.begin.filename, loc.begin.line, loc.begin.column, loc.end.line, loc.end.column);
 }
 
 static bool param_has_no_default(const AstNode* param) {

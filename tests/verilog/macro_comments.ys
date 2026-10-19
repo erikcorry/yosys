@@ -26,4 +26,4 @@ module top(
 endmodule
 
 EOT
-select -assert-count 1 w:after a:src=*:24.* %i
+select -assert-count 1 w:after a:src=*:000024.* %i
