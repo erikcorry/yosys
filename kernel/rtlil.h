@@ -1614,6 +1614,15 @@ public:
 	RTLIL::ObjRange<RTLIL::Cell*> cells() { return RTLIL::ObjRange<RTLIL::Cell*>(&cells_, &refcount_cells_); }
 	int cells_size() const { return cells_.size(); }
 	RTLIL::Cell* cell_at(int index) const { return cells_.element(index)->second; }
+	// Removing wires or cells leaves holes in wires_/cells_ (that keeps the
+	// order of the remaining objects independent of what was removed), and
+	// wire_at()/cell_at() are only O(1) without holes. Call this from the
+	// main thread before indexing wires or cells from parallel workers.
+	void compact_wires_cells() {
+		log_assert(refcount_wires_ == 0 && refcount_cells_ == 0);
+		wires_.compact();
+		cells_.compact();
+	}
 
 	// Removing wires is expensive. If you have to remove wires, remove them all at once.
 	void remove(const pool<RTLIL::Wire*> &wires);

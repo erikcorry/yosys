@@ -30,7 +30,7 @@ struct AnalysisContext {
 	SigMap assign_map;
 	const RTLIL::Module *mod;
 	ParallelDispatchThreadPool::Subpool &subpool;
-	AnalysisContext(RTLIL::Module* m, ParallelDispatchThreadPool::Subpool &p) : assign_map(m), mod(m), subpool(p) {}
+	AnalysisContext(RTLIL::Module* m, ParallelDispatchThreadPool::Subpool &p) : assign_map(m), mod(m), subpool(p) { m->compact_wires_cells(); }
 };
 
 struct RmStats {

@@ -101,6 +101,7 @@ private:
 			keep_module.set();
 		}
 
+		module->compact_wires_cells();
 		ParallelDispatchThreadPool::Subpool subpool(thread_pool, ThreadPool::work_pool_size(0, module->cells_size(), 1000));
 		ShardedVector<Module*> deps(subpool);
 		const RTLIL::Module *const_module = module;

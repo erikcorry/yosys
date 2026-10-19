@@ -338,6 +338,7 @@ struct RTLILFrontendWorker {
 
 	RTLIL::Wire *legalize_wire(RTLIL::IdString id)
 	{
+		current_module->compact_wires_cells();
 		int wires_size = current_module->wires_size();
 		if (wires_size == 0)
 			error("No wires found for legalization");

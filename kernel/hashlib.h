@@ -14,6 +14,7 @@
 
 #include <array>
 #include <atomic>
+#include <new>
 #include <stdexcept>
 #include <algorithm>
 #include <optional>
@@ -371,6 +372,73 @@ inline unsigned int hashtable_size(unsigned int min_size)
 	throw std::length_error("hash table exceeded maximum size.");
 }
 
+// Entries of dict and pool live in an insertion-ordered vector, and the
+// hashtable only holds indices into it, like Python's dict. Erasing an entry
+// destroys its value and leaves a hole (next == entry_hole) so that the
+// order of the remaining entries doesn't depend on what was erased or in
+// which order. Holes are squeezed out by compact(), copying and sort(), and
+// by erase() when that doesn't invalidate any iterators that erase() must
+// keep valid (see do_erase()). insert() never moves entries.
+// The last entry of the vector is never a hole.
+const int entry_hole = -2;
+
+template<typename V>
+struct hashtable_entry
+{
+	union { V udata; };
+	int next;
+
+	hashtable_entry() : next(entry_hole) { }
+	hashtable_entry(const V &udata, int next) : udata(udata), next(next) { }
+	hashtable_entry(V &&udata, int next) : udata(std::move(udata)), next(next) { }
+
+	hashtable_entry(const hashtable_entry &other) : next(other.next) {
+		if (!other.is_hole())
+			new (&udata) V(other.udata);
+	}
+	hashtable_entry(hashtable_entry &&other) noexcept(std::is_nothrow_move_constructible_v<V>) : next(other.next) {
+		if (!other.is_hole())
+			new (&udata) V(std::move(other.udata));
+	}
+	hashtable_entry &operator=(const hashtable_entry &other) {
+		if (this != &other) {
+			make_hole();
+			if (!other.is_hole())
+				new (&udata) V(other.udata);
+			next = other.next;
+		}
+		return *this;
+	}
+	hashtable_entry &operator=(hashtable_entry &&other) noexcept(std::is_nothrow_move_constructible_v<V>) {
+		if (this != &other) {
+			make_hole();
+			if (!other.is_hole())
+				new (&udata) V(std::move(other.udata));
+			next = other.next;
+		}
+		return *this;
+	}
+	~hashtable_entry() {
+		if (!is_hole())
+			udata.~V();
+	}
+
+	bool is_hole() const { return next == entry_hole; }
+	// Requires this to be a hole and other to not be one, makes other a hole.
+	// The entry is unlinked, so callers must rehash afterwards.
+	void move_from(hashtable_entry &other) {
+		new (&udata) V(std::move(other.udata));
+		next = -1;
+		other.make_hole();
+	}
+	void make_hole() {
+		if (!is_hole()) {
+			udata.~V();
+			next = entry_hole;
+		}
+	}
+};
+
 template<typename K, typename T, typename OPS = hash_ops<K>> class dict;
 template<typename K, int offset = 0, typename OPS = hash_ops<K>> class idict;
 template<typename K, typename OPS = hash_ops<K>> class pool;
@@ -405,19 +473,12 @@ private:
 
 template<typename K, typename T, typename OPS>
 class HASHLIB_ATTRIBUTE_WARN_UNUSED dict {
-	struct entry_t
-	{
-		std::pair<K, T> udata;
-		int next;
-
-		entry_t() { }
-		entry_t(const std::pair<K, T> &udata, int next) : udata(udata), next(next) { }
-		entry_t(std::pair<K, T> &&udata, int next) : udata(std::move(udata)), next(next) { }
-		bool operator<(const entry_t &other) const { return udata.first < other.udata.first; }
-	};
+	typedef hashtable_entry<std::pair<K, T>> entry_t;
 
 	std::vector<int> hashtable;
 	std::vector<entry_t> entries;
+	int n_holes = 0;
+	int first_hole = 0; // only meaningful if n_holes > 0
 	OPS ops;
 	static_assert(std::is_nothrow_default_constructible_v<OPS>, "move ops are noexcept and default-construct OPS");
 
@@ -443,11 +504,59 @@ class HASHLIB_ATTRIBUTE_WARN_UNUSED dict {
 		hashtable.resize(hashtable_size(entries.capacity() * hashtable_size_factor), -1);
 
 		for (int i = 0; i < int(entries.size()); i++) {
-			do_assert(-1 <= entries[i].next && entries[i].next < int(entries.size()));
+			if (entries[i].is_hole())
+				continue;
 			Hasher::hash_t hash = do_hash(entries[i].udata.first);
 			entries[i].next = hashtable[hash];
 			hashtable[hash] = i;
 		}
+	}
+
+	// Squeeze out the holes, assuming there are none below index. Entries
+	// below index stay where they are.
+	void do_compact_from(int index)
+	{
+		int w = index;
+		for (int r = index; r < int(entries.size()); r++) {
+			if (entries[r].is_hole())
+				continue;
+			if (r != w)
+				entries[w].move_from(entries[r]);
+			w++;
+		}
+		entries.erase(entries.begin() + w, entries.end());
+		n_holes = 0;
+		do_rehash();
+	}
+
+	void do_compact()
+	{
+		if (n_holes > 0)
+			do_compact_from(first_hole);
+	}
+
+	void do_permute(const std::vector<int> &perm)
+	{
+		std::vector<entry_t> new_entries(perm.size());
+		for (int i = 0; i < int(perm.size()); i++)
+			new_entries[i].move_from(entries[perm[i]]);
+		entries.swap(new_entries);
+		do_rehash();
+	}
+
+	void do_copy(const dict &other)
+	{
+		entries.clear();
+		n_holes = 0;
+		if (other.n_holes == 0) {
+			entries = other.entries;
+		} else {
+			entries.reserve(other.size());
+			for (auto &it : other.entries)
+				if (!it.is_hole())
+					entries.push_back(it);
+		}
+		do_rehash();
 	}
 
 	int do_erase(int index, Hasher::hash_t hash)
@@ -469,34 +578,54 @@ class HASHLIB_ATTRIBUTE_WARN_UNUSED dict {
 			entries[k].next = entries[index].next;
 		}
 
-		int back_idx = entries.size()-1;
+		entries[index].make_hole();
+		first_hole = n_holes > 0 ? std::min(first_hole, index) : index;
+		n_holes++;
 
-		if (index != back_idx)
-		{
-			Hasher::hash_t back_hash = do_hash(entries[back_idx].udata.first);
-
-			k = hashtable[back_hash];
-			do_assert(0 <= k && k < int(entries.size()));
-
-			if (k == back_idx) {
-				hashtable[back_hash] = index;
-			} else {
-				while (entries[k].next != back_idx) {
-					k = entries[k].next;
-					do_assert(0 <= k && k < int(entries.size()));
-				}
-				entries[k].next = index;
-			}
-
-			entries[index] = std::move(entries[back_idx]);
+		while (!entries.empty() && entries.back().is_hole()) {
+			entries.pop_back();
+			n_holes--;
 		}
 
-		entries.pop_back();
-
+		// Once half the entries are holes, compact if that only moves
+		// entries above the erased one. Those are the ones that iterators
+		// which haven't passed the erased entry yet would still visit, and
+		// erase() is allowed to invalidate such iterators.
 		if (entries.empty())
 			hashtable.clear();
+		else if (2 * n_holes >= int(entries.size()) && first_hole == index)
+			do_compact_from(index);
 
 		return 1;
+	}
+
+	// Index of the next entry in iteration order, which goes from the
+	// back of the vector to the front. Tolerates index being past the
+	// end because erase() may have removed trailing holes.
+	int iter_next(int index) const
+	{
+		index = std::min(index, int(entries.size())) - 1;
+		while (index >= 0 && entries[index].is_hole())
+			index--;
+		return index;
+	}
+
+	int iter_prev(int index) const
+	{
+		index++;
+		while (entries[index].is_hole())
+			index++;
+		return index;
+	}
+
+	int element_index(int n) const
+	{
+		int index = int(entries.size())-1;
+		if (n_holes == 0)
+			return index-n;
+		while (n-- > 0 && index >= 0)
+			index = iter_next(index);
+		return index;
 	}
 
 	int do_lookup(const K &key, Hasher::hash_t &hash)
@@ -583,11 +712,18 @@ public:
 		typedef const std::pair<K, T>* pointer;
 		typedef const std::pair<K, T>& reference;
 		const_iterator() { }
-		const_iterator operator++() { index--; return *this; }
-		const_iterator operator++(int) { const_iterator tmp = *this; index--; return tmp; }
-		const_iterator operator--() { index++; return *this; }
-		const_iterator operator--(int) { const_iterator tmp = *this; index++; return tmp; }
-		const_iterator operator+=(int amt) { index -= amt; return *this; }
+		const_iterator operator++() { index = ptr->iter_next(index); return *this; }
+		const_iterator operator++(int) { const_iterator tmp = *this; index = ptr->iter_next(index); return tmp; }
+		const_iterator operator--() { index = ptr->iter_prev(index); return *this; }
+		const_iterator operator--(int) { const_iterator tmp = *this; index = ptr->iter_prev(index); return tmp; }
+		const_iterator operator+=(int amt) {
+			if (ptr->n_holes == 0)
+				index -= amt;
+			else
+				while (amt-- > 0)
+					index = ptr->iter_next(index);
+			return *this;
+		}
 		bool operator<(const const_iterator &other) const { return index > other.index; }
 		bool operator==(const const_iterator &other) const { return index == other.index; }
 		bool operator!=(const const_iterator &other) const { return index != other.index; }
@@ -609,8 +745,15 @@ public:
 		typedef std::pair<K, T>* pointer;
 		typedef std::pair<K, T>& reference;
 		iterator() { }
-		iterator operator++() { index--; return *this; }
-		iterator operator+=(int amt) { index -= amt; return *this; }
+		iterator operator++() { index = ptr->iter_next(index); return *this; }
+		iterator operator+=(int amt) {
+			if (ptr->n_holes == 0)
+				index -= amt;
+			else
+				while (amt-- > 0)
+					index = ptr->iter_next(index);
+			return *this;
+		}
 		bool operator<(const iterator &other) const { return index > other.index; }
 		bool operator==(const iterator &other) const { return index == other.index; }
 		bool operator!=(const iterator &other) const { return index != other.index; }
@@ -634,8 +777,7 @@ public:
 
 	dict(const dict &other)
 	{
-		entries = other.entries;
-		do_rehash();
+		do_copy(other);
 	}
 
 	dict(dict &&other) noexcept
@@ -644,8 +786,8 @@ public:
 	}
 
 	dict &operator=(const dict &other) {
-		entries = other.entries;
-		do_rehash();
+		if (this != &other)
+			do_copy(other);
 		return *this;
 	}
 
@@ -829,20 +971,28 @@ public:
 	template<typename Compare = std::less<K>>
 	void sort(Compare comp = Compare())
 	{
-		std::sort(entries.begin(), entries.end(), [comp](const entry_t &a, const entry_t &b){ return comp(b.udata.first, a.udata.first); });
-		do_rehash();
+		do_compact();
+		std::vector<int> perm(entries.size());
+		for (int i = 0; i < int(perm.size()); i++)
+			perm[i] = i;
+		std::stable_sort(perm.begin(), perm.end(), [&](int a, int b){ return comp(entries[b].udata.first, entries[a].udata.first); });
+		do_permute(perm);
 	}
 
 	void swap(dict &other)
 	{
 		hashtable.swap(other.hashtable);
 		entries.swap(other.entries);
+		std::swap(n_holes, other.n_holes);
+		std::swap(first_hole, other.first_hole);
 	}
 
 	bool operator==(const dict &other) const {
 		if (size() != other.size())
 			return false;
 		for (auto &it : entries) {
+			if (it.is_hole())
+				continue;
 			auto oit = other.find(it.udata.first);
 			if (oit == other.end() || !(oit->second == it.udata.second))
 				return false;
@@ -857,6 +1007,8 @@ public:
 	[[nodiscard]] Hasher hash_into(Hasher h) const {
 		commutative_hash comm;
 		for (auto &it : entries) {
+			if (it.is_hole())
+				continue;
 			Hasher entry_hash;
 			entry_hash.eat(it.udata.first);
 			entry_hash.eat(it.udata.second);
@@ -866,16 +1018,20 @@ public:
 	}
 
 	void reserve(size_t n) { entries.reserve(n); }
-	size_t size() const { return entries.size(); }
+	size_t size() const { return entries.size() - n_holes; }
 	bool empty() const { return entries.empty(); }
-	void clear() { hashtable.clear(); entries.clear(); }
+	void clear() { hashtable.clear(); entries.clear(); n_holes = 0; }
+
+	// Squeeze out the holes left by erase(). This invalidates iterators.
+	// element() is only O(1) on a dict without holes.
+	void compact() { do_compact(); }
 
 	iterator begin() { return iterator(this, int(entries.size())-1); }
-	iterator element(int n) { return iterator(this, int(entries.size())-1-n); }
+	iterator element(int n) { return iterator(this, element_index(n)); }
 	iterator end() { return iterator(nullptr, -1); }
 
 	const_iterator begin() const { return const_iterator(this, int(entries.size())-1); }
-	const_iterator element(int n) const { return const_iterator(this, int(entries.size())-1-n); }
+	const_iterator element(int n) const { return const_iterator(this, element_index(n)); }
 	const_iterator end() const { return const_iterator(this, -1); }
 };
 
@@ -885,18 +1041,12 @@ class HASHLIB_ATTRIBUTE_WARN_UNUSED pool
 	template<typename, int, typename> friend class idict;
 
 protected:
-	struct entry_t
-	{
-		K udata;
-		int next;
-
-		entry_t() { }
-		entry_t(const K &udata, int next) : udata(udata), next(next) { }
-		entry_t(K &&udata, int next) : udata(std::move(udata)), next(next) { }
-	};
+	typedef hashtable_entry<K> entry_t;
 
 	std::vector<int> hashtable;
 	std::vector<entry_t> entries;
+	int n_holes = 0;
+	int first_hole = 0; // only meaningful if n_holes > 0
 	OPS ops;
 	static_assert(std::is_nothrow_default_constructible_v<OPS>, "move ops are noexcept and default-construct OPS");
 
@@ -922,11 +1072,59 @@ protected:
 		hashtable.resize(hashtable_size(entries.capacity() * hashtable_size_factor), -1);
 
 		for (int i = 0; i < int(entries.size()); i++) {
-			do_assert(-1 <= entries[i].next && entries[i].next < int(entries.size()));
+			if (entries[i].is_hole())
+				continue;
 			Hasher::hash_t hash = do_hash(entries[i].udata);
 			entries[i].next = hashtable[hash];
 			hashtable[hash] = i;
 		}
+	}
+
+	// Squeeze out the holes, assuming there are none below index. Entries
+	// below index stay where they are.
+	void do_compact_from(int index)
+	{
+		int w = index;
+		for (int r = index; r < int(entries.size()); r++) {
+			if (entries[r].is_hole())
+				continue;
+			if (r != w)
+				entries[w].move_from(entries[r]);
+			w++;
+		}
+		entries.erase(entries.begin() + w, entries.end());
+		n_holes = 0;
+		do_rehash();
+	}
+
+	void do_compact()
+	{
+		if (n_holes > 0)
+			do_compact_from(first_hole);
+	}
+
+	void do_permute(const std::vector<int> &perm)
+	{
+		std::vector<entry_t> new_entries(perm.size());
+		for (int i = 0; i < int(perm.size()); i++)
+			new_entries[i].move_from(entries[perm[i]]);
+		entries.swap(new_entries);
+		do_rehash();
+	}
+
+	void do_copy(const pool &other)
+	{
+		entries.clear();
+		n_holes = 0;
+		if (other.n_holes == 0) {
+			entries = other.entries;
+		} else {
+			entries.reserve(other.size());
+			for (auto &it : other.entries)
+				if (!it.is_hole())
+					entries.push_back(it);
+		}
+		do_rehash();
 	}
 
 	int do_erase(int index, Hasher::hash_t hash)
@@ -946,32 +1144,44 @@ protected:
 			entries[k].next = entries[index].next;
 		}
 
-		int back_idx = entries.size()-1;
+		entries[index].make_hole();
+		first_hole = n_holes > 0 ? std::min(first_hole, index) : index;
+		n_holes++;
 
-		if (index != back_idx)
-		{
-			Hasher::hash_t back_hash = do_hash(entries[back_idx].udata);
-
-			k = hashtable[back_hash];
-			if (k == back_idx) {
-				hashtable[back_hash] = index;
-			} else {
-				while (entries[k].next != back_idx) {
-					k = entries[k].next;
-					do_assert(0 <= k && k < int(entries.size()));
-				}
-				entries[k].next = index;
-			}
-
-			entries[index] = std::move(entries[back_idx]);
+		while (!entries.empty() && entries.back().is_hole()) {
+			entries.pop_back();
+			n_holes--;
 		}
 
-		entries.pop_back();
-
+		// Once half the entries are holes, compact if that only moves
+		// entries above the erased one. Those are the ones that iterators
+		// which haven't passed the erased entry yet would still visit, and
+		// erase() is allowed to invalidate such iterators.
 		if (entries.empty())
 			hashtable.clear();
+		else if (2 * n_holes >= int(entries.size()) && first_hole == index)
+			do_compact_from(index);
 
 		return 1;
+	}
+
+	// See dict::iter_next()
+	int iter_next(int index) const
+	{
+		index = std::min(index, int(entries.size())) - 1;
+		while (index >= 0 && entries[index].is_hole())
+			index--;
+		return index;
+	}
+
+	int element_index(int n) const
+	{
+		int index = int(entries.size())-1;
+		if (n_holes == 0)
+			return index-n;
+		while (n-- > 0 && index >= 0)
+			index = iter_next(index);
+		return index;
 	}
 
 	int do_lookup(const K &key, Hasher::hash_t &hash)
@@ -1048,7 +1258,7 @@ public:
 		typedef K* pointer;
 		typedef K& reference;
 		const_iterator() { }
-		const_iterator operator++() { index--; return *this; }
+		const_iterator operator++() { index = ptr->iter_next(index); return *this; }
 		bool operator==(const const_iterator &other) const { return index == other.index; }
 		bool operator!=(const const_iterator &other) const { return index != other.index; }
 		const K &operator*() const { return ptr->entries[index].udata; }
@@ -1069,7 +1279,7 @@ public:
 		typedef K* pointer;
 		typedef K& reference;
 		iterator() { }
-		iterator operator++() { index--; return *this; }
+		iterator operator++() { index = ptr->iter_next(index); return *this; }
 		bool operator==(const iterator &other) const { return index == other.index; }
 		bool operator!=(const iterator &other) const { return index != other.index; }
 		K &operator*() { return ptr->entries[index].udata; }
@@ -1085,8 +1295,7 @@ public:
 
 	pool(const pool &other)
 	{
-		entries = other.entries;
-		do_rehash();
+		do_copy(other);
 	}
 
 	pool(pool &&other) noexcept
@@ -1095,8 +1304,8 @@ public:
 	}
 
 	pool &operator=(const pool &other) {
-		entries = other.entries;
-		do_rehash();
+		if (this != &other)
+			do_copy(other);
 		return *this;
 	}
 
@@ -1207,8 +1416,12 @@ public:
 	template<typename Compare = std::less<K>>
 	void sort(Compare comp = Compare())
 	{
-		std::sort(entries.begin(), entries.end(), [comp](const entry_t &a, const entry_t &b){ return comp(b.udata, a.udata); });
-		do_rehash();
+		do_compact();
+		std::vector<int> perm(entries.size());
+		for (int i = 0; i < int(perm.size()); i++)
+			perm[i] = i;
+		std::stable_sort(perm.begin(), perm.end(), [&](int a, int b){ return comp(entries[b].udata, entries[a].udata); });
+		do_permute(perm);
 	}
 
 	K pop()
@@ -1223,13 +1436,15 @@ public:
 	{
 		hashtable.swap(other.hashtable);
 		entries.swap(other.entries);
+		std::swap(n_holes, other.n_holes);
+		std::swap(first_hole, other.first_hole);
 	}
 
 	bool operator==(const pool &other) const {
 		if (size() != other.size())
 			return false;
 		for (auto &it : entries)
-			if (!other.count(it.udata))
+			if (!it.is_hole() && !other.count(it.udata))
 				return false;
 		return true;
 	}
@@ -1241,22 +1456,26 @@ public:
 	[[nodiscard]] Hasher hash_into(Hasher h) const {
 		commutative_hash comm;
 		for (auto &it : entries) {
-			comm.eat(ops.hash(it.udata));
+			if (!it.is_hole())
+				comm.eat(ops.hash(it.udata));
 		}
 		return comm.hash_into(h);
 	}
 
 	void reserve(size_t n) { entries.reserve(n); }
-	size_t size() const { return entries.size(); }
+	size_t size() const { return entries.size() - n_holes; }
 	bool empty() const { return entries.empty(); }
-	void clear() { hashtable.clear(); entries.clear(); }
+	void clear() { hashtable.clear(); entries.clear(); n_holes = 0; }
+
+	// See dict::compact()
+	void compact() { do_compact(); }
 
 	iterator begin() { return iterator(this, int(entries.size())-1); }
-	iterator element(int n) { return iterator(this, int(entries.size())-1-n); }
+	iterator element(int n) { return iterator(this, element_index(n)); }
 	iterator end() { return iterator(nullptr, -1); }
 
 	const_iterator begin() const { return const_iterator(this, int(entries.size())-1); }
-	const_iterator element(int n) const { return const_iterator(this, int(entries.size())-1-n); }
+	const_iterator element(int n) const { return const_iterator(this, element_index(n)); }
 	const_iterator end() const { return const_iterator(nullptr, -1); }
 };
 

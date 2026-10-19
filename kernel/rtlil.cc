@@ -2450,6 +2450,7 @@ static void check_id_keys(const dict<RTLIL::IdString, RTLIL::Const> &keyed)
 void check_module(RTLIL::Module *module, ParallelDispatchThreadPool &thread_pool)
 {
 #ifndef NDEBUG
+	module->compact_wires_cells();
 	ParallelDispatchThreadPool::Subpool subpool(thread_pool, ThreadPool::work_pool_size(0, module->cells_size(), 1000));
 	const RTLIL::Module *const_module = module;
 

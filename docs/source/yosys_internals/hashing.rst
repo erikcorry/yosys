@@ -19,6 +19,13 @@ The main characteristics are:
    that have not passed the erased element yet are invalidated. (``erase()``
    itself returns valid iterator to the next element.)
 
+* like Python's ``dict``, elements are kept in insertion order (iteration
+   visits the most recently inserted element first) and ``erase()`` doesn't
+   change the relative order of the remaining elements. The order of
+   iteration therefore never depends on hash values. Erased elements leave
+   holes that are squeezed out over time. ``.element(n)`` is only O(1) on a
+   container without holes; ``.compact()`` removes them.
+
 * no iterators are invalidated by ``insert()``. elements are inserted at
    ``begin()``. i.e. only a new iterator that starts at ``begin()`` will see the
    inserted elements.

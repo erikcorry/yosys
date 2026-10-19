@@ -72,6 +72,7 @@ YOSYS_NAMESPACE_BEGIN
 
 void remove_temporary_cells(RTLIL::Module *module, ParallelDispatchThreadPool::Subpool &subpool, bool verbose)
 {
+	module->compact_wires_cells();
 	ShardedVector<RTLIL::Cell*> delcells(subpool);
 	ShardedVector<RTLIL::SigSig> new_connections(subpool);
 	const RTLIL::Module *const_module = module;

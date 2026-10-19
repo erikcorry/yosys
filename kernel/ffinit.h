@@ -70,6 +70,7 @@ struct FfInitVals
 		sigmap = sigmap_;
 		initbits.clear();
 
+		module->compact_wires_cells();
 		const RTLIL::Module *const_module = module;
 		ParallelDispatchThreadPool::Subpool subpool(thread_pool, ThreadPool::work_pool_size(0, module->wires_size(), 1000));
 		ShardedVector<RTLIL::Wire*> init_wires(subpool);

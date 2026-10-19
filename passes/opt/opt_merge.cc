@@ -399,6 +399,7 @@ struct OptMergeWorker
 		// beyond the user's control.
 		while (did_something)
 		{
+			module->compact_wires_cells();
 			int cells_size = module->cells_size();
 			log("Computing hashes of %d cells of `%s'.\n", cells_size, module->name);
 			std::vector<std::vector<std::vector<CellHash>>> sharded_bucketed_cell_hashes(workers);
